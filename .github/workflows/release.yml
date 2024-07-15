@@ -1,0 +1,121 @@
+name: release
+
+on:
+  # release:
+  #   types:
+  #     - created
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "バージョン情報（A.B.C / A.B.C-preview.D）"
+        required: true
+      prerelease:
+        description: "プレリリースかどうか"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  config: # 全 jobs で利用する定数の定義. `env` が利用できないコンテキストでも利用できる.
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      version_or_latest: ${{ steps.vars.outputs.version_or_latest }}
+    steps:
+      - name: <Setup> Declare variables
+        id: vars
+        run: |
+          : # release タグ名, または workflow_dispatch でのバージョン名. リリースでない (push event) 場合は空文字列
+          echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          : # release タグ名, または workflow_dispatch でのバージョン名, または '999.999.999'
+          echo "version_or_latest=${{ github.event.inputs.version || '999.999.999' }}" >> "$GITHUB_OUTPUT"
+
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: setup CPython
+        uses: actions/setup-python@v5
+        with:
+          cache: "pip"
+          cache-dependency-path: "requirements-dev.lock"
+          python-version-file: ".python-version"
+
+      - name: install dependencies
+        id: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.lock
+
+      - name: lint
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: |
+          ruff check --output-format github .
+
+      - name: format
+        if: ${{ always() && steps.install.outcome == 'success' }}
+        run: |
+          ruff format --check .
+
+  release:
+    runs-on: ubuntu-22.04
+    needs:
+      - config
+      - check
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: setup CPython
+        uses: actions/setup-python@v5
+        with:
+          cache: "pip"
+          cache-dependency-path: "requirements.lock"
+          python-version-file: ".python-version"
+
+      - name: install dependencies
+        id: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      # ここから自動リリース用の処理を記述
+      - name: Replace version
+        run: |
+          set -eux
+          sed -i 's/version = "999.999.999"/version = \"${{ needs.config.outputs.version_or_latest }}\"/' pyproject.toml
+
+      - name: Extract package name
+        id: package_name
+        run: |
+          set -eux
+          PACKAGE_NAME=$(grep -xoE "name = \"(.*?)\"" pyproject.toml | sed -r 's/name = "(.*?)"/\1/')
+          echo "package_name=${PACKAGE_NAME}_${{ needs.config.outputs.version_or_latest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Packaging
+        run: |
+          set -eux
+          zip -r ${{ steps.package_name.outputs.package_name }}.zip src/ pyproject.toml
+
+      - name: Create release
+        if: needs.config.outputs.version != ''
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          prerelease: ${{ github.event.inputs.prerelease }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.config.outputs.version }}
+          artifacts: ${{ steps.package_name.outputs.package_name }}.zip
+          commit: ${{ github.sha }}
